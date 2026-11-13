@@ -93,6 +93,38 @@ def atr(kl, n=14):
     return sum(seg) / len(seg) if seg else 0.0
 
 
+def ema(vals, n):
+    k = 2 / (n + 1)
+    e = vals[0]
+    out = [e]
+    for v in vals[1:]:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def macd_state(kl, fast=12, slow=26, sig=9):
+    """MACD(12,26,9) + 动能变化：柱的方向、放大缩小、零轴位置。"""
+    closes = [x["c"] for x in kl]
+    dif = [a - b for a, b in zip(ema(closes, fast), ema(closes, slow))]
+    dea = ema(dif, sig)
+    hist = [(a - b) * 2 for a, b in zip(dif, dea)]
+    cross = "金叉" if dif[-1] > dea[-1] else "死叉"
+    zero = "零轴上" if dif[-1] > 0 else "零轴下"
+    d1 = hist[-1] - hist[-2] if len(hist) > 1 else 0
+    d3 = hist[-1] - hist[-4] if len(hist) > 4 else 0
+    # 放大/缩小按绝对值判断：柱越粗动能越强，跟正负号无关
+    mag, mag_prev = abs(hist[-1]), abs(hist[-2]) if len(hist) > 1 else abs(hist[-1])
+    trend = "放大" if mag > mag_prev else ("缩小" if mag < mag_prev else "持平")
+    if hist[-1] > 0:
+        label = "多头动能加强" if trend == "放大" else ("多头动能减弱" if trend == "缩小" else "多头动能为平")
+    else:
+        label = "空头动能加强" if trend == "放大" else ("空头动能减弱" if trend == "缩小" else "空头动能为平")
+    return {"dif": dif[-1], "dea": dea[-1], "hist": hist[-1], "cross": cross,
+            "zero": zero, "trend": trend, "d1": d1, "d3": d3, "label": label,
+            "text": f"{cross}·{zero}·柱{hist[-1]:+.2f}{trend}"}
+
+
 def swings(kl, w=SWING_W):
     highs, lows = [], []
     for i in range(w, len(kl) - w):
@@ -157,8 +189,19 @@ def build_plan(item, cfg, equity):
         "struct": st, "swing_high": hi, "swing_low": lo,
         "side": side, "entry": None, "stop": None, "t1": None, "t2": None,
         "rr": None, "risk_pct": None, "notional": None, "invalid": None,
+        "macd": macd_state(kl), "macd4": macd_state(k4),
         "h4": {"close": last4, "ma20": m20_4, "above": last4 > m20_4},
     }
+    plan["side"] = side
+
+    # 动能闸：动能正在朝反方向加速时，不许逆着开（这是最容易亏钱的位置）
+    dm = plan["macd"]
+    if side == "short" and dm["cross"] == "金叉" and dm["hist"] > 0 and dm["trend"] == "放大":
+        side = plan["side"] = "wait"
+        plan["wait_reason"] = f"MACD {dm['text']}，动能向上，此时空是逆势，等柱重新缩小"
+    elif side == "long" and dm["cross"] == "死叉" and dm["hist"] < 0 and dm["trend"] == "放大":
+        side = plan["side"] = "wait"
+        plan["wait_reason"] = f"MACD {dm['text']}，动能向下，此时多是接刀，等柱缩小"
 
     highs_above = [h[1] for h in highs if h[1] > close]
     lows_below = [l[1] for l in lows if l[1] < close]
@@ -235,7 +278,8 @@ def build_plan(item, cfg, equity):
 def render_line(p):
     """终端一行的简短结论。"""
     arrow = {"long": "只做多", "short": "只做空", "wait": "观望"}[p["side"]]
-    head = f"{p['name']:<5} {p['symbol']:<10} {fmt(p['price']):>10}  {p['struct']:<3} {arrow:<4}"
+    head = (f"{p['name']:<5} {p['symbol']:<10} {fmt(p['price']):>10}  {p['struct']:<3} {arrow:<4}"
+            f" [{p['macd']['text']}]")
     if p["side"] == "wait":
         return head + f" | {p['wait_reason']}"
     return (head + f" | 进 {fmt(p['entry'][0])}~{fmt(p['entry'][1])}"
@@ -245,15 +289,15 @@ def render_line(p):
 
 def render_md(plans, equity, date_str):
     lines = [f"# 合约计划 · {date_str}", "",
-                 f"账户权益假设 {equity:,.0f} U | 单笔风险 {RISK_PCT*100:.0f}% | 结构用日线，时机参考 4H", "",
-                 "| 标的 | 现价 | 结构 | 结论 | 进场区 | 止损 | 目标1 | 目标2 | 盈亏比 | 名义仓位 |",
-                 "|---|---|---|---|---|---|---|---|---|---|"]
+                 f"账户权益假设 {equity:,.0f} U | 单笔风险 {RISK_PCT*100:.0f}% | 结构用日线，时机看 4H + MACD", "",
+                 "| 标的 | 现价 | 结构 | 日线动能 | 结论 | 进场区 | 止损 | 目标1 | 目标2 | 盈亏比 | 名义仓位 |",
+                 "|---|---|---|---|---|---|---|---|---|---|---|"]
     for p in plans:
         if p["side"] == "wait":
-            lines.append(f"| {p['name']} | {fmt(p['price'])} | {p['struct']} | 观望 | — | — | — | — | — | — |")
+            lines.append(f"| {p['name']} | {fmt(p['price'])} | {p['struct']} | {p['macd']['text']} | 观望 | — | — | — | — | — | — |")
         else:
-            lines.append("| {n} | {px} | {st} | {sd} | {e0}~{e1} | {sl} | {t1} | {t2} | {rr:.1f}:1 | {nt}U |".format(
-                n=p["name"], px=fmt(p["price"]), st=p["struct"],
+            lines.append("| {n} | {px} | {st} | {mc} | {sd} | {e0}~{e1} | {sl} | {t1} | {t2} | {rr:.1f}:1 | {nt}U |".format(
+                n=p["name"], px=fmt(p["price"]), st=p["struct"], mc=p["macd"]["text"],
                 sd={"long": "只做多", "short": "只做空"}[p["side"]],
                 e0=fmt(p["entry"][0]), e1=fmt(p["entry"][1]), sl=fmt(p["stop"]),
                 t1=fmt(p["t1"]), t2=fmt(p["t2"]), rr=p["rr"], nt=fmt(p["notional"])))
@@ -266,7 +310,15 @@ def render_md(plans, equity, date_str):
             lines.append(f"- **{p['name']}**：等{d}进 {fmt(p['entry'][0])}~{fmt(p['entry'][1])} 才动手，"
                          f"止损 {fmt(p['stop'])}，先看 {fmt(p['t1'])}，破了看 {fmt(p['t2'])}。"
                          f"{p['invalid']} 即失效，无条件走。")
-    lines += ["", "> 计划不是预测。价格没到进场区就不做，这是纪律。", ""]
+    lines += ["", "## 动能观察（MACD 12,26,9）", "",
+              "| 标的 | 日线 | 动能判断 | 4H | 4H 与日线 | 三日柱变化 |",
+              "|---|---|---|---|---|---|"]
+    for p in plans:
+        m, m4 = p["macd"], p["macd4"]
+        sync = "同向" if (m["hist"] > 0) == (m4["hist"] > 0) else "相背"
+        lines.append(f"| {p['name']} | {m['text']} | {m['label']} | {m4['text']} | {sync} | {m['d3']:+.2f} |")
+    lines += ["", "> 动能只做时机过滤，不改结构方向：动能向下加速时不做多，向上加速时不做空。",
+              "> 计划不是预测。价格没到进场区就不做，这是纪律。", ""]
     return "\n".join(lines)
 
 
