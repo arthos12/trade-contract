@@ -19,6 +19,8 @@ monitor.py            主程序（纯标准库，零依赖）
 config.example.json   配置模板（复制成 config.json 再填）
 install.sh            Linux 一键部署（systemd）
 start_monitor.bat     Windows 后台启动（pythonw，无窗口）
+GUIDE.md              完整使用说明（能力边界 / 部署 / 排错 / 收到信号后怎么用）
+ROADMAP.md            功能规划（P0/P1/P2 与明确不做清单）
 ```
 
 ## 快速开始
