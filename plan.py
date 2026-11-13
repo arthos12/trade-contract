@@ -216,8 +216,13 @@ def build_plan(item, cfg, equity):
             plan["wait_reason"] = f"盈亏比 {plan['rr']:.1f}:1 不足 {MIN_RR}:1，不值得做"
 
     if plan["side"] == "wait":
-        plan.setdefault("wait_reason",
-                        f"结构{st}、价格{'上' if close > m20 else '下'}穿MA20，方向不明确")
+        if not plan.get("wait_reason"):
+            if st == "下降":
+                plan["wait_reason"] = f"结构下降但价在 MA20 上方（{fmt(m20)}），等重新跌破再做空"
+            elif st == "上升":
+                plan["wait_reason"] = f"结构上升但价跌破 MA20（{fmt(m20)}），等站回再做多"
+            else:
+                plan["wait_reason"] = f"区间震荡 {fmt(low60)}~{fmt(high60)}，等突破或等边缘"
         plan["invalid"] = f"站上 MA20（{fmt(m20)}）才谈做多；跌破 {fmt(low60)} 说明跌势延续"
     else:
         risk_amt = equity * RISK_PCT
