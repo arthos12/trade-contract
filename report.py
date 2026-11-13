@@ -55,42 +55,61 @@ def levels(p, s):
 
 
 def scenario(p, s, sup, res):
-    """两套可执行情景。止损优先放结构位；结构位超过 3ATR 才退回 1.5ATR。"""
+    """两套可执行情景。止损优先放结构位；上限 3ATR、下限 1ATR。
+    下限 1ATR 是关键：结构位离进场太近时，止损会被一根普通 K 线扫掉，
+    分母过小会把盈亏比算得虚高（曾用 0.45ATR 止损算出 5.5:1 的假优势）。"""
     out = []
     atr = s["atr"]
     max_risk = plan.MAX_STOP_PCT
+    min_stop = 1.0 * atr          # 止损至少 1 个 ATR
 
     if sup:
         trig = sup[0]
         stop = res[0] if res else trig + 1.5 * atr
         if (stop - trig) > 3 * atr:          # 最近阻力太远，止损退回 1.5ATR
             stop = trig + 1.5 * atr
+        if (stop - trig) < min_stop:         # 结构位太近，止损外推到 1ATR
+            stop = trig + min_stop
         tgt = sup[1] if len(sup) > 1 else s["l60"]
         risk = (stop - trig) / trig if trig else 0
         rr = (trig - tgt) / (stop - trig) if stop > trig else 0
         ok = bool(risk > 0 and risk <= max_risk and rr >= MIN_RR)
+        if ok:
+            note = ""
+        elif risk > max_risk:
+            note = (f"止损 {risk*100:.1f}% 超过 {max_risk*100:.0f}% 红线 —— ATR {s['atr_pct']:.1f}%，"
+                    f"放足 1ATR 就已经越线，此标的在当前波动下不该做")
+        else:
+            note = f"盈亏比 {rr:.1f}:1 低于 {MIN_RR:.0f}:1 下限"
         out.append({
             "name": "情景 A · 破位做空", "cond": f"日线收盘跌破 {fmt(trig)}",
             "entry": trig, "stop": stop, "target": tgt, "rr": rr, "risk": risk,
             "pos": (plan.RISK_PCT * 10000 / risk) if risk > 0 else 0,
-            "ok": ok,
-            "note": "" if ok else f"止损 {risk*100:.1f}%（红线 {max_risk*100:.0f}%）/ 盈亏比 {rr:.1f}:1（下限 {MIN_RR:.0f}:1）不达标",
+            "ok": ok, "note": note,
         })
     if res:
         trig = res[0]
         stop = sup[0] if sup else trig - 1.5 * atr
         if (trig - stop) > 3 * atr:
             stop = trig - 1.5 * atr
+        if (trig - stop) < min_stop:
+            stop = trig - min_stop
         tgt = res[1] if len(res) > 1 else s["h60"]
         risk = (trig - stop) / trig if trig else 0
         rr = (tgt - trig) / (trig - stop) if trig > stop else 0
         ok = bool(risk > 0 and risk <= max_risk and rr >= MIN_RR)
+        if ok:
+            note = ""
+        elif risk > max_risk:
+            note = (f"止损 {risk*100:.1f}% 超过 {max_risk*100:.0f}% 红线 —— ATR {s['atr_pct']:.1f}%，"
+                    f"放足 1ATR 就已经越线，此标的在当前波动下不该做")
+        else:
+            note = f"盈亏比 {rr:.1f}:1 低于 {MIN_RR:.0f}:1 下限"
         out.append({
             "name": "情景 B · 站上做多", "cond": f"日线收盘站上 {fmt(trig)}",
             "entry": trig, "stop": stop, "target": tgt, "rr": rr, "risk": risk,
             "pos": (plan.RISK_PCT * 10000 / risk) if risk > 0 else 0,
-            "ok": ok,
-            "note": "" if ok else f"止损 {risk*100:.1f}%（红线 {max_risk*100:.0f}%）/ 盈亏比 {rr:.1f}:1（下限 {MIN_RR:.0f}:1）不达标",
+            "ok": ok, "note": note,
         })
     return out
 
