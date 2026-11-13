@@ -141,6 +141,8 @@ def macd_state(kl, fast=12, slow=26, sig=9):
     mag, mag_prev = abs(hist[-1]), abs(hist[-2]) if len(hist) > 1 else abs(hist[-1])
     trend = "放大" if mag > mag_prev else ("缩小" if mag < mag_prev else "持平")
     b = bar_detail(hist)
+    # 「已过峰」只在柱缩小时成立：柱还在放大那是刚起步，不是退潮
+    b["fading"] = bool(b["fading"] and trend == "缩小")
     if hist[-1] > 0:
         label = "多头动能加强" if trend == "放大" else ("多头动能减弱" if trend == "缩小" else "多头动能为平")
     else:
@@ -343,16 +345,23 @@ def build_plan(item, cfg, equity):
 
 
 def render_line(p):
-    """终端一行的简短结论。"""
+    """终端输出：标题行 + 三层 MACD 明细 + 结论。"""
     arrow = {"long": "只做多", "short": "只做空", "wait": "观望"}[p["side"]]
     tf_brief = " ".join(f"{n}{t['bias']}" for n, t in p["tfs"])
-    head = (f"{p['name']:<5} {p['symbol']:<10} {fmt(p['price']):>10}  {p['struct']:<3} {arrow:<4}"
-            f" [{tf_brief}]")
+    lines = [f"{p['name']:<5} {p['symbol']:<10} {fmt(p['price']):>10}  {p['struct']:<3} {arrow:<4}"
+             f"  [{tf_brief}]"]
+    for name, t in p["tfs"]:
+        m, b = t["macd"], t["macd"]["bar"]
+        flag = "·已过峰" if b["fading"] else ""
+        lines.append(f"        {name:<4} {m['cross']}·{m['zero']}·柱{m['hist']:+.2f}{m['trend']}"
+                     f"（{b['streak']}根，强度 {b['ratio']*100:.0f}%{flag}） — {m['label']}")
     if p["side"] == "wait":
-        return head + f" | {p['wait_reason']}"
-    return (head + f" | 进 {fmt(p['entry'][0])}~{fmt(p['entry'][1])}"
-            f" 损 {fmt(p['stop'])} 标 {fmt(p['t1'])}/{fmt(p['t2'])}"
-            f" 比 {p['rr']:.1f}:1 仓 {fmt(p['notional'])}U")
+        lines.append(f"        → 观望：{p['wait_reason']}")
+    else:
+        lines.append(f"        → 进 {fmt(p['entry'][0])}~{fmt(p['entry'][1])}"
+                     f" 损 {fmt(p['stop'])} 标 {fmt(p['t1'])}/{fmt(p['t2'])}"
+                     f" 比 {p['rr']:.1f}:1 仓 {fmt(p['notional'])}U")
+    return "\n".join(lines)
 
 
 def render_tfs(p):
