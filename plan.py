@@ -112,7 +112,7 @@ def macd_raw(kl, fast=12, slow=26, sig=9):
 
 
 def bar_detail(hist):
-    """柱子的细化判断：连续同向根数、10 根内峰值、当前强度占比、是否已过峰。"""
+    """柱子的细化判断：连续同向根数、10 根内同号峰值、当前强度占比、是否已过峰。"""
     streak = 1
     for i in range(len(hist) - 1, 0, -1):
         if (hist[i] > 0) == (hist[i - 1] > 0):
@@ -120,12 +120,18 @@ def bar_detail(hist):
         else:
             break
     win = hist[-10:] if len(hist) >= 10 else hist
-    peak_abs = max(abs(x) for x in win)
-    peak_idx = max(range(len(win)), key=lambda i: abs(win[i]))
+    sign = hist[-1] > 0
+    # 只在「同号」的柱里找峰值：金叉前的负柱不能拿来当本轮多头动能的顶点
+    cand = [(i, x) for i, x in enumerate(win) if (x > 0) == sign]
+    if cand:
+        peak_idx, peak_val = max(cand, key=lambda t: abs(t[1]))
+        peak_abs = abs(peak_val)
+    else:
+        peak_idx, peak_abs = len(win) - 1, abs(hist[-1])
     cur = abs(hist[-1])
     ratio = (cur / peak_abs) if peak_abs else 0
     ago = len(win) - 1 - peak_idx
-    # 已过峰：峰值出现在 2 根以上之前，且当前只剩不到 75% 的强度
+    # 已过峰：同号峰值出现在 2 根以上之前，且当前只剩不到 75% 的强度
     fading = ago >= 2 and ratio < 0.75
     return {"streak": streak, "peak": peak_abs, "ratio": ratio,
             "fading": fading, "ago": ago}
