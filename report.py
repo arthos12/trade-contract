@@ -45,10 +45,23 @@ def stats(kl):
     }
 
 
-def levels(p, s):
+def swing_points(kl, w=3, lookback=60):
+    """最近 60 根的局部摆动高低点，给关键价位补充参照，避免只靠最后一组 swing。"""
+    seg = kl[-lookback:]
+    lows, highs = [], []
+    for i in range(w, len(seg) - w):
+        if seg[i]["l"] <= min(x["l"] for x in seg[i - w:i + w + 1]):
+            lows.append(seg[i]["l"])
+        if seg[i]["h"] >= max(x["h"] for x in seg[i - w:i + w + 1]):
+            highs.append(seg[i]["h"])
+    return lows, highs
+
+
+def levels(p, s, kl):
     c = s["c"]
-    sup = [x for x in [p["swing_low"], s["l20"], s["l60"], s["ma50"], s["ma20"]] if x < c]
-    res = [x for x in [p["swing_high"], s["h20"], s["h60"], s["ma50"], s["ma20"]] if x > c]
+    sl, sh = swing_points(kl)
+    sup = [x for x in [p.get("swing_low"), s["l20"], s["l60"], s["ma50"], s["ma20"]] + sl if x and x < c]
+    res = [x for x in [p.get("swing_high"), s["h20"], s["h60"], s["ma50"], s["ma20"]] + sh if x and x > c]
     sup = sorted(set(round(x, 2) for x in sup), reverse=True)[:3]
     res = sorted(set(round(x, 2) for x in res))[:3]
     return sup, res
@@ -56,37 +69,41 @@ def levels(p, s):
 
 def scenario(p, s, sup, res):
     """两套可执行情景。止损优先放结构位；上限 3ATR、下限 1ATR。
-    下限 1ATR 是关键：结构位离进场太近时，止损会被一根普通 K 线扫掉，
-    分母过小会把盈亏比算得虚高（曾用 0.45ATR 止损算出 5.5:1 的假优势）。"""
+    目标必须与进场至少相隔 1ATR，否则破位即到目标、等于没有目标，直接判「不做」。"""
     out = []
     atr = s["atr"]
     max_risk = plan.MAX_STOP_PCT
-    min_stop = 1.0 * atr          # 止损至少 1 个 ATR
+    min_stop = 1.0 * atr
+    gap = 1.0 * atr
 
     if sup:
         trig = sup[0]
         stop = res[0] if res else trig + 1.5 * atr
-        if (stop - trig) > 3 * atr:          # 最近阻力太远，止损退回 1.5ATR
+        if (stop - trig) > 3 * atr:
             stop = trig + 1.5 * atr
-        if (stop - trig) < min_stop:         # 结构位太近，止损外推到 1ATR
+        if (stop - trig) < min_stop:
             stop = trig + min_stop
-        tgt = sup[1] if len(sup) > 1 else s["l60"]
+        below = [x for x in sup if trig - x >= gap]
+        tgt = max(below) if below else None
         risk = (stop - trig) / trig if trig else 0
-        rr = (trig - tgt) / (stop - trig) if stop > trig else 0
-        ok = bool(risk > 0 and risk <= max_risk and rr >= MIN_RR)
-        if ok:
-            note = ""
+        rr = (trig - tgt) / (stop - trig) if tgt else 0
+        if tgt is None:
+            ok, note = False, "破位后下方没有 ≥1ATR 的结构空间，等于没有目标，不做"
         elif risk > max_risk:
+            ok = False
             note = (f"止损 {risk*100:.1f}% 超过 {max_risk*100:.0f}% 红线 —— ATR {s['atr_pct']:.1f}%，"
                     f"放足 1ATR 就已经越线，此标的在当前波动下不该做")
+        elif rr < MIN_RR:
+            ok, note = False, f"盈亏比 {rr:.1f}:1 低于 {MIN_RR:.0f}:1 下限"
         else:
-            note = f"盈亏比 {rr:.1f}:1 低于 {MIN_RR:.0f}:1 下限"
+            ok, note = True, ""
         out.append({
             "name": "情景 A · 破位做空", "cond": f"日线收盘跌破 {fmt(trig)}",
             "entry": trig, "stop": stop, "target": tgt, "rr": rr, "risk": risk,
             "pos": (plan.RISK_PCT * 10000 / risk) if risk > 0 else 0,
             "ok": ok, "note": note,
         })
+
     if res:
         trig = res[0]
         stop = sup[0] if sup else trig - 1.5 * atr
@@ -94,17 +111,20 @@ def scenario(p, s, sup, res):
             stop = trig - 1.5 * atr
         if (trig - stop) < min_stop:
             stop = trig - min_stop
-        tgt = res[1] if len(res) > 1 else s["h60"]
+        above = [x for x in res if x - trig >= gap]
+        tgt = min(above) if above else None
         risk = (trig - stop) / trig if trig else 0
-        rr = (tgt - trig) / (trig - stop) if trig > stop else 0
-        ok = bool(risk > 0 and risk <= max_risk and rr >= MIN_RR)
-        if ok:
-            note = ""
+        rr = (tgt - trig) / (trig - stop) if tgt else 0
+        if tgt is None:
+            ok, note = False, "站上后上方没有 ≥1ATR 的结构空间，等于没有目标，不做"
         elif risk > max_risk:
+            ok = False
             note = (f"止损 {risk*100:.1f}% 超过 {max_risk*100:.0f}% 红线 —— ATR {s['atr_pct']:.1f}%，"
                     f"放足 1ATR 就已经越线，此标的在当前波动下不该做")
+        elif rr < MIN_RR:
+            ok, note = False, f"盈亏比 {rr:.1f}:1 低于 {MIN_RR:.0f}:1 下限"
         else:
-            note = f"盈亏比 {rr:.1f}:1 低于 {MIN_RR:.0f}:1 下限"
+            ok, note = True, ""
         out.append({
             "name": "情景 B · 站上做多", "cond": f"日线收盘站上 {fmt(trig)}",
             "entry": trig, "stop": stop, "target": tgt, "rr": rr, "risk": risk,
@@ -118,7 +138,7 @@ def build(sym, name, cfg, equity):
     p = plan.build_plan({"symbol": sym, "name": name, "kind": "美股"}, cfg, equity)
     kl = plan.klines(sym, "1d", 220, cfg)
     s = stats(kl)
-    sup, res = levels(p, s)
+    sup, res = levels(p, s, kl)
     sc = scenario(p, s, sup, res)
     return p, s, sup, res, sc
 
@@ -203,7 +223,8 @@ def render(sym, name, p, s, sup, res, sc, equity):
     A("| 情景 | 触发条件 | 进场 | 止损 | 目标 | 风险 | 盈亏比 | 名义仓位 | 判定 |")
     A("|---|---|---|---|---|---|---|---|---|")
     for x in sc:
-        A(f"| {x['name']} | {x['cond']} | {fmt(x['entry'])} | {fmt(x['stop'])} | {fmt(x['target'])} | "
+        tgt_txt = fmt(x["target"]) if x["target"] else "—"
+        A(f"| {x['name']} | {x['cond']} | {fmt(x['entry'])} | {fmt(x['stop'])} | {tgt_txt} | "
           f"{x['risk']*100:.1f}% | {x['rr']:.1f}:1 | {fmt(x['pos'])}U | {'可执行' if x['ok'] else '不达标'} |")
     A("")
     for x in sc:
