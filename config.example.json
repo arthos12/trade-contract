@@ -1,0 +1,21 @@
+{
+  "bark_key": "",
+  "bark_server": "https://api.day.app",
+  "proxy": "",
+  "poll_seconds": 180,
+  "sound": "alarm",
+  "traders": [
+    {
+      "name": "熬鹰",
+      "platform": "okx",
+      "unique_code": "",
+      "link": ""
+    },
+    {
+      "name": "TONY",
+      "platform": "okx",
+      "unique_code": "",
+      "link": ""
+    }
+  ]
+}
