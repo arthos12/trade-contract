@@ -218,7 +218,7 @@ def build_plan(item, cfg, equity):
     if plan["side"] == "wait":
         plan.setdefault("wait_reason",
                         f"结构{st}、价格{'上' if close > m20 else '下'}穿MA20，方向不明确")
-        plan["invalid"] = f"站上 {fmt(hi)} 转多 / 跌破 {fmt(lo)} 转空"
+        plan["invalid"] = f"站上 MA20（{fmt(m20)}）才谈做多；跌破 {fmt(low60)} 说明跌势延续"
     else:
         risk_amt = equity * RISK_PCT
         plan["notional"] = risk_amt / plan["risk_pct"]
