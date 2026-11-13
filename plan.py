@@ -103,26 +103,86 @@ def ema(vals, n):
     return out
 
 
-def macd_state(kl, fast=12, slow=26, sig=9):
-    """MACD(12,26,9) + 动能变化：柱的方向、放大缩小、零轴位置。"""
+def macd_raw(kl, fast=12, slow=26, sig=9):
     closes = [x["c"] for x in kl]
     dif = [a - b for a, b in zip(ema(closes, fast), ema(closes, slow))]
     dea = ema(dif, sig)
     hist = [(a - b) * 2 for a, b in zip(dif, dea)]
+    return dif, dea, hist
+
+
+def bar_detail(hist):
+    """柱子的细化判断：连续同向根数、10 根内峰值、当前强度占比、是否已过峰。"""
+    streak = 1
+    for i in range(len(hist) - 1, 0, -1):
+        if (hist[i] > 0) == (hist[i - 1] > 0):
+            streak += 1
+        else:
+            break
+    win = hist[-10:] if len(hist) >= 10 else hist
+    peak_abs = max(abs(x) for x in win)
+    peak_idx = max(range(len(win)), key=lambda i: abs(win[i]))
+    cur = abs(hist[-1])
+    ratio = (cur / peak_abs) if peak_abs else 0
+    ago = len(win) - 1 - peak_idx
+    # 已过峰：峰值出现在 2 根以上之前，且当前只剩不到 75% 的强度
+    fading = ago >= 2 and ratio < 0.75
+    return {"streak": streak, "peak": peak_abs, "ratio": ratio,
+            "fading": fading, "ago": ago}
+
+
+def macd_state(kl, fast=12, slow=26, sig=9):
+    """MACD(12,26,9) + 动能变化：交叉、零轴、柱强弱（按绝对值）、柱是否过峰。"""
+    dif, dea, hist = macd_raw(kl, fast, slow, sig)
     cross = "金叉" if dif[-1] > dea[-1] else "死叉"
     zero = "零轴上" if dif[-1] > 0 else "零轴下"
     d1 = hist[-1] - hist[-2] if len(hist) > 1 else 0
     d3 = hist[-1] - hist[-4] if len(hist) > 4 else 0
-    # 放大/缩小按绝对值判断：柱越粗动能越强，跟正负号无关
     mag, mag_prev = abs(hist[-1]), abs(hist[-2]) if len(hist) > 1 else abs(hist[-1])
     trend = "放大" if mag > mag_prev else ("缩小" if mag < mag_prev else "持平")
+    b = bar_detail(hist)
     if hist[-1] > 0:
         label = "多头动能加强" if trend == "放大" else ("多头动能减弱" if trend == "缩小" else "多头动能为平")
     else:
         label = "空头动能加强" if trend == "放大" else ("空头动能减弱" if trend == "缩小" else "空头动能为平")
+    if b["fading"]:
+        label += "（已过峰）"
+    text = f"{cross}·{zero}·柱{hist[-1]:+.2f}{trend}"
     return {"dif": dif[-1], "dea": dea[-1], "hist": hist[-1], "cross": cross,
             "zero": zero, "trend": trend, "d1": d1, "d3": d3, "label": label,
-            "text": f"{cross}·{zero}·柱{hist[-1]:+.2f}{trend}"}
+            "bar": b, "text": text}
+
+
+def tf_state(kl):
+    """单周期状态：结构 + 均线偏向 + MACD。"""
+    st, _, _ = structure(kl)
+    close = kl[-1]["c"]
+    m20 = ma(kl, 20)
+    a = atr(kl)
+    bias = "多" if close > m20 + 0.3 * a else ("空" if close < m20 - 0.3 * a else "平")
+    return {"struct": st, "bias": bias, "close": close, "ma20": m20,
+            "atr": a, "macd": macd_state(kl)}
+
+
+def consensus(d, h4, h1):
+    """三层共振结论：(判断, 是否可做)"""
+    bs = [d["bias"], h4["bias"], h1["bias"]]
+    hs = [d["macd"]["hist"], h4["macd"]["hist"], h1["macd"]["hist"]]
+    same_bias = len(set(bs)) == 1 and bs[0] in ("多", "空")
+    same_hist = all(x > 0 for x in hs) or all(x < 0 for x in hs)
+    if same_bias and same_hist:
+        return ("三层同向偏空，空头共振" if bs[0] == "空" else "三层同向偏多，多头共振"), True
+    if same_bias:
+        dh, oh = hs[0], hs[1:]
+        if all((dh > 0) != (o > 0) for o in oh):
+            who = "多头" if dh > 0 else "空头"
+            return f"三层均偏{bs[0]}，但日线柱在走{who}（反向），等柱同向再动", False
+        return f"三层均偏{bs[0]}，柱子未齐，等齐再动", False
+    if d["bias"] == "空" and h4["bias"] == "多":
+        return "日线空、4H 多：下跌中的反弹，等 4H 转空", False
+    if d["bias"] == "多" and h4["bias"] == "空":
+        return "日线多、4H 空：上涨中的回调，等 4H 转多", False
+    return "层级不一致，等对齐再动", False
 
 
 def swings(kl, w=SWING_W):
@@ -192,6 +252,13 @@ def build_plan(item, cfg, equity):
         "macd": macd_state(kl), "macd4": macd_state(k4),
         "h4": {"close": last4, "ma20": m20_4, "above": last4 > m20_4},
     }
+    # 三层周期：日线定大趋势、4H 定中周期、1H 定小周期
+    try:
+        k1 = klines(sym, "1h", 200, cfg)
+    except Exception:
+        k1 = k4
+    plan["tfs"] = [("日线", tf_state(kl)), ("4H", tf_state(k4)), ("1H", tf_state(k1))]
+    plan["consensus"], plan["aligned"] = consensus(*[t[1] for t in plan["tfs"]])
     plan["side"] = side
 
     # 动能闸：动能正在朝反方向加速时，不许逆着开（这是最容易亏钱的位置）
@@ -278,13 +345,29 @@ def build_plan(item, cfg, equity):
 def render_line(p):
     """终端一行的简短结论。"""
     arrow = {"long": "只做多", "short": "只做空", "wait": "观望"}[p["side"]]
+    tf_brief = " ".join(f"{n}{t['bias']}" for n, t in p["tfs"])
     head = (f"{p['name']:<5} {p['symbol']:<10} {fmt(p['price']):>10}  {p['struct']:<3} {arrow:<4}"
-            f" [{p['macd']['text']}]")
+            f" [{tf_brief}]")
     if p["side"] == "wait":
         return head + f" | {p['wait_reason']}"
     return (head + f" | 进 {fmt(p['entry'][0])}~{fmt(p['entry'][1])}"
             f" 损 {fmt(p['stop'])} 标 {fmt(p['t1'])}/{fmt(p['t2'])}"
             f" 比 {p['rr']:.1f}:1 仓 {fmt(p['notional'])}U")
+
+
+def render_tfs(p):
+    """单标的的多周期明细：大趋势 + 中周期 + 小周期 + 柱子细节。"""
+    lines = [f"### {p['name']} · 现价 {fmt(p['price'])}", "",
+             "| 周期 | 结构 | 价 vs MA20 | MACD | 柱细节 |",
+             "|---|---|---|---|---|"]
+    for name, t in p["tfs"]:
+        m, b = t["macd"], t["macd"]["bar"]
+        rel = "上方" if t["close"] > t["ma20"] else "下方"
+        extra = "，已过峰" if b["fading"] else ""
+        lines.append(f"| {name} | {t['struct']} | {rel}（{fmt(t['ma20'])}） | {m['text']} | "
+                     f"{b['streak']} 根同向，强度 {b['ratio']*100:.0f}%{extra} |")
+    lines += ["", f"**共振**：{p['consensus']}"]
+    return lines
 
 
 def render_md(plans, equity, date_str):
@@ -310,14 +393,19 @@ def render_md(plans, equity, date_str):
             lines.append(f"- **{p['name']}**：等{d}进 {fmt(p['entry'][0])}~{fmt(p['entry'][1])} 才动手，"
                          f"止损 {fmt(p['stop'])}，先看 {fmt(p['t1'])}，破了看 {fmt(p['t2'])}。"
                          f"{p['invalid']} 即失效，无条件走。")
-    lines += ["", "## 动能观察（MACD 12,26,9）", "",
-              "| 标的 | 日线 | 动能判断 | 4H | 4H 与日线 | 三日柱变化 |",
-              "|---|---|---|---|---|---|"]
+    lines += ["", "## 多周期与柱子（日线 / 4H / 1H）", "",
+              "| 标的 | 日线 | 4H | 1H | 共振 |",
+              "|---|---|---|---|---|"]
     for p in plans:
-        m, m4 = p["macd"], p["macd4"]
-        sync = "同向" if (m["hist"] > 0) == (m4["hist"] > 0) else "相背"
-        lines.append(f"| {p['name']} | {m['text']} | {m['label']} | {m4['text']} | {sync} | {m['d3']:+.2f} |")
-    lines += ["", "> 动能只做时机过滤，不改结构方向：动能向下加速时不做多，向上加速时不做空。",
+        t = p["tfs"]
+        lines.append(f"| {p['name']} | {t[0][1]['bias']}·{t[0][1]['struct']} "
+                     f"| {t[1][1]['bias']}·{t[1][1]['struct']} "
+                     f"| {t[2][1]['bias']}·{t[2][1]['struct']} | {p['consensus']} |")
+    lines += ["", "**柱子判断口径**：柱的放大/缩小按绝对值算（柱越粗动能越强，与正负无关）；"
+              "「已过峰」= 10 根内最粗的柱出现在 2 根以上之前，且当前强度不足峰值的 75%，说明这段动能正在退潮。", ""]
+    for p in plans:
+        lines += render_tfs(p) + [""]
+    lines += ["> 动能只做时机过滤，不改结构方向：动能向下加速时不做多，向上加速时不做空。",
               "> 计划不是预测。价格没到进场区就不做，这是纪律。", ""]
     return "\n".join(lines)
 
