@@ -143,10 +143,10 @@ def build_plan(item, cfg, equity):
     last4 = k4[-1]["c"]
     m20_4 = ma(k4, 20)
 
-    # 方向闸：结构与均线同向才算有方向
-    if st == "上升" and close > m20:
+    # 方向闸：结构与均线同向才算有方向（加 0.3ATR 缓冲，避免压在均线上来回翻转）
+    if st == "上升" and close > m20 + 0.3 * a:
         side = "long"
-    elif st == "下降" and close < m20:
+    elif st == "下降" and close < m20 - 0.3 * a:
         side = "short"
     else:
         side = "wait"
