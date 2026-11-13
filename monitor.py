@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-跟单信号监控 -> Bark 推送
+跟单信号监控 -> Bark 推送（支持 OKX / 币安）
 
-数据源：OKX 公开带单接口（无需登录）
-  - 当前持仓：/api/v5/copytrading/public-current-subpositions?instType=SWAP&uniqueCode=xxx
-  - 只有 开仓均价 / 杠杆 / 仓位 / 保证金 / 现价 / 浮动盈亏，没有止损价（平台不公开）
+数据源（均为公开接口，无需登录、无需 API key）：
+  OKX   当前持仓：/api/v5/copytrading/public-current-subpositions?instType=SWAP&uniqueCode=xxx
+  Binance 当前持仓：/bapi/futures/v1/friendly/future/copy-trade/lead-data/positions?portfolioId=xxx
+         （返回带单员所有 symbol 的持仓状态，空仓需按 positionAmount 过滤）
+
+两个平台都只公开：开仓均价 / 杠杆 / 仓位 / 现价 / 浮动盈亏。
+**都不公开止损价**，止损需自己按结构位定。
 
 推送事件：新开仓、平仓、加减仓
 
@@ -30,16 +34,25 @@ LOG_DIR = os.path.join(BASE, "logs")
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
-UA = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "clienttype": "web",
+    "lang": "zh-CN",
+    "accept": "*/*",
+}
 OKX = "https://www.okx.com"
+BINANCE = "https://www.binance.com"
 
-_CFG_REF = {}  # 运行时的配置，用于取 proxy
+_CFG_REF = {}  # 运行时配置，用于取 proxy
 
 
 def log(msg):
     os.makedirs(LOG_DIR, exist_ok=True)
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
-    print(line)
+    try:
+        print(line)
+    except Exception:
+        pass
     with open(os.path.join(LOG_DIR, "monitor.log"), "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
@@ -58,7 +71,7 @@ def http_json(url, timeout=20, retries=3):
     last = None
     for _ in range(retries):
         try:
-            req = urllib.request.Request(url, headers=UA)
+            req = urllib.request.Request(url, headers=HEADERS)
             return json.loads(_opener().open(req, timeout=timeout).read().decode("utf-8"))
         except Exception as e:
             last = e
@@ -80,13 +93,103 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
-def okx_positions(code):
+# ---------------------------------------------------------------- 取数（统一结构）
+
+def _num(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def fetch_okx(code):
+    """返回统一结构列表。"""
     url = f"{OKX}/api/v5/copytrading/public-current-subpositions?instType=SWAP&uniqueCode={code}"
     d = http_json(url)
     if d.get("code") != "0":
-        raise RuntimeError(d.get("msg") or d.get("code"))
-    return [p for p in (d.get("data") or []) if p]
+        raise RuntimeError(f"OKX: {d.get('msg') or d.get('code')}")
+    out = []
+    for p in (d.get("data") or []):
+        if not p:
+            continue
+        symbol = p.get("instId") or ""
+        side = (p.get("posSide") or "").lower()
+        if side not in ("long", "short"):
+            # net（单向持仓）不给方向，用 (现价-均价)×浮盈 的符号推断
+            o, m, u = _num(p.get("openAvgPx")), _num(p.get("markPx")), _num(p.get("upl"))
+            if o and u:
+                side = "long" if (m - o) * u >= 0 else "short"
+            else:
+                side = ""
+        out.append({
+            "platform": "okx",
+            "symbol": symbol,
+            "side": side,
+            "lever": p.get("lever") or "",
+            "entry": _num(p.get("openAvgPx")),
+            "mark": _num(p.get("markPx")),
+            "qty": p.get("subPos") or "",
+            "extra": f"保证金 {fmt_price(p.get('margin'))}",
+            "upl": _num(p.get("upl")),
+            "upl_ratio": p.get("uplRatio") or "",
+            "raw_key": f"{symbol}|{side}",
+        })
+    return out
 
+
+def fetch_binance(pid):
+    """币安返回带单员所有 symbol 的持仓状态（含大量空仓），按 positionAmount 过滤。"""
+    url = f"{BINANCE}/bapi/futures/v1/friendly/future/copy-trade/lead-data/positions?portfolioId={pid}"
+    d = http_json(url)
+    if d.get("success") is False or d.get("code") not in ("000000", None):
+        raise RuntimeError(f"Binance: {d.get('message') or d.get('code')}")
+    rows = d.get("data") or []
+    out = []
+    for p in rows:
+        if not isinstance(p, dict):
+            continue
+        amt = _num(p.get("positionAmount"))
+        if abs(amt) < 1e-12:      # 空仓
+            continue
+        symbol = p.get("symbol") or ""
+        ps = (p.get("positionSide") or "BOTH").upper()
+        if ps == "LONG":
+            side = "long"
+        elif ps == "SHORT":
+            side = "short"
+        else:
+            e, m, u = _num(p.get("entryPrice")), _num(p.get("markPrice")), _num(p.get("unrealizedProfit"))
+            side = "long" if (m - e) * u >= 0 else "short" if e and u else ""
+        out.append({
+            "platform": "binance",
+            "symbol": symbol,
+            "side": side,
+            "lever": p.get("leverage") or "",
+            "entry": _num(p.get("entryPrice")),
+            "mark": _num(p.get("markPrice")),
+            "qty": f"{abs(amt):g}",
+            "extra": f"名义 {fmt_price(abs(_num(p.get('notionalValue'))))}",
+            "upl": _num(p.get("unrealizedProfit")),
+            "upl_ratio": "",
+            "raw_key": f"{symbol}|{side}",
+        })
+    return out
+
+
+def fetch(trader):
+    platform = (trader.get("platform") or "okx").lower()
+    if platform == "binance":
+        pid = (trader.get("portfolio_id") or trader.get("unique_code") or "").strip()
+        if not pid:
+            raise RuntimeError("未配置 portfolio_id")
+        return fetch_binance(pid)
+    code = (trader.get("unique_code") or "").strip()
+    if not code:
+        raise RuntimeError("未配置 unique_code")
+    return fetch_okx(code)
+
+
+# ---------------------------------------------------------------- 推送
 
 def bark(cfg, title, body, link=None):
     key = (cfg.get("bark_key") or "").strip()
@@ -113,66 +216,50 @@ def bark(cfg, title, body, link=None):
 def fmt_price(v):
     try:
         f = float(v)
-        return f"{f:,.2f}" if abs(f) >= 1 else f"{f:.6f}"
+        if abs(f) >= 1000:
+            return f"{f:,.2f}"
+        if abs(f) >= 1:
+            return f"{f:.2f}"
+        return f"{f:.6f}"
     except Exception:
         return str(v)
 
 
-def infer_side(p):
-    """posSide=net 时接口不给方向，用 (现价-均价) 与 浮盈 的符号相乘推断。"""
-    ps = (p.get("posSide") or "").lower()
-    if ps in ("long", "short"):
-        return ps
-    try:
-        o = float(p.get("openAvgPx")); m = float(p.get("markPx")); u = float(p.get("upl"))
-    except Exception:
-        return ""
-    if u == 0 or o == 0:
-        return ""
-    return "long" if (m - o) * u >= 0 else "short"
-
-
 def side_text(p):
-    s = infer_side(p)
-    return {"long": "多", "short": "空"}.get(s, "方向待定")
+    return {"long": "多", "short": "空"}.get(p.get("side"), "方向待定")
 
 
-def bark_send(title, body, link):
-    return bark(_CFG_REF["cfg"], title, body, link)
+def plat_text(p):
+    return "币安" if p.get("platform") == "binance" else "OKX"
 
 
-def alert_new(name, p, trader):
-    title = f"【{name}】新开仓 {p.get('instId')}"
-    body = " | ".join([
-        f"{side_text(p)} {p.get('lever')}x",
-        f"均价 {fmt_price(p.get('openAvgPx'))}",
-        f"现价 {fmt_price(p.get('markPx'))}",
-        f"仓位 {p.get('subPos')} 张",
-        f"保证金 {fmt_price(p.get('margin'))}",
-    ])
-    return bark_send(title, body, trader.get("link")), title, body
-
-
-def alert_close(name, p, trader, last_mark):
-    title = f"【{name}】已平仓 {p.get('instId')}"
-    body = " | ".join([
-        f"{side_text(p)} {p.get('lever')}x",
-        f"开仓均价 {fmt_price(p.get('openAvgPx'))}",
-        f"最后价 {fmt_price(last_mark or p.get('markPx'))}",
-        f"浮动盈亏 {p.get('upl')} ({p.get('uplRatio')})",
-    ])
-    return bark_send(title, body, trader.get("link")), title, body
-
-
-def alert_size(name, p, prev, trader):
-    title = f"【{name}】加减仓 {p.get('instId')}"
-    body = " | ".join([
-        f"{side_text(p)} {p.get('lever')}x",
-        f"仓位 {prev.get('subPos')} → {p.get('subPos')}",
-        f"均价 {fmt_price(p.get('openAvgPx'))}",
-        f"现价 {fmt_price(p.get('markPx'))}",
-    ])
-    return bark_send(title, body, trader.get("link")), title, body
+def build(kind, name, p, prev=None, last_mark=None):
+    if kind == "new":
+        title = f"【{name}】新开仓 {p['symbol']}"
+        body = " | ".join([
+            f"{side_text(p)} {p['lever']}x",
+            f"均价 {fmt_price(p['entry'])}",
+            f"现价 {fmt_price(p['mark'])}",
+            f"持仓 {p['qty']}" + (f" | {p['extra']}" if p.get("extra") else ""),
+        ])
+    elif kind == "close":
+        title = f"【{name}】已平仓 {p['symbol']}"
+        body = " | ".join([
+            f"{side_text(p)} {p['lever']}x",
+            f"开仓均价 {fmt_price(p['entry'])}",
+            f"最后价 {fmt_price(last_mark if last_mark not in (None, '') else p['mark'])}",
+            f"浮盈 {p['upl']:,.2f}" + (f" ({p['upl_ratio']})" if p.get("upl_ratio") else ""),
+        ])
+    else:
+        title = f"【{name}】加减仓 {p['symbol']}"
+        body = " | ".join([
+            f"{side_text(p)} {p['lever']}x",
+            f"仓位 {prev['qty']} → {p['qty']}",
+            f"均价 {fmt_price(p['entry'])}",
+            f"现价 {fmt_price(p['mark'])}",
+        ])
+    body += f" | {plat_text(p)}"
+    return title, body
 
 
 def run_once(cfg, state):
@@ -180,12 +267,8 @@ def run_once(cfg, state):
     pushed = 0
     for trader in cfg.get("traders", []):
         name = trader.get("name") or "未命名"
-        code = (trader.get("unique_code") or "").strip()
-        if not code:
-            log(f"{name} 未配置 unique_code，跳过")
-            continue
         try:
-            data = okx_positions(code)
+            data = fetch(trader)
         except Exception as e:
             log(f"{name} 拉取失败：{e}")
             continue
@@ -194,9 +277,7 @@ def run_once(cfg, state):
         prev = tstate.get("positions", {})
         initialized = tstate.get("initialized", False)
 
-        cur = {}
-        for p in data:
-            cur[f"{p.get('instId')}|{p.get('posSide')}"] = p
+        cur = {p["raw_key"]: p for p in data}
 
         if not initialized:
             tstate["positions"] = cur
@@ -204,25 +285,33 @@ def run_once(cfg, state):
             log(f"{name} 首次运行，已记录现有 {len(cur)} 个持仓（不推送）")
             continue
 
+        if not cur:
+            log(f"{name} 当前无持仓（接口返回 0 条）")
+
         for k, p in cur.items():
             if k not in prev:
-                _, ti, bo = alert_new(name, p, trader)
+                ti, bo = build("new", name, p)
+                bark(cfg, ti, bo, trader.get("link"))
                 pushed += 1
                 log(ti + " " + bo)
+
         for k, p in prev.items():
             if k not in cur:
                 last_mark = state.get("last_mark", {}).get(k)
-                _, ti, bo = alert_close(name, p, trader, last_mark)
+                ti, bo = build("close", name, p, last_mark=last_mark)
+                bark(cfg, ti, bo, trader.get("link"))
                 pushed += 1
                 log(ti + " " + bo)
+
         for k, p in cur.items():
-            if k in prev and str(p.get("subPos")) != str(prev[k].get("subPos")):
-                _, ti, bo = alert_size(name, p, prev[k], trader)
+            if k in prev and str(p.get("qty")) != str(prev[k].get("qty")):
+                ti, bo = build("size", name, p, prev=prev[k])
+                bark(cfg, ti, bo, trader.get("link"))
                 pushed += 1
                 log(ti + " " + bo)
 
         tstate["positions"] = cur
-        state.setdefault("last_mark", {}).update({k: p.get("markPx") for k, p in cur.items()})
+        state.setdefault("last_mark", {}).update({k: p["mark"] for k, p in cur.items()})
 
     return pushed
 
