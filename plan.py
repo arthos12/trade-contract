@@ -222,7 +222,8 @@ def build_plan(item, cfg, equity):
             elif st == "上升":
                 plan["wait_reason"] = f"结构上升但价跌破 MA20（{fmt(m20)}），等站回再做多"
             else:
-                plan["wait_reason"] = f"区间震荡 {fmt(low60)}~{fmt(high60)}，等突破或等边缘"
+                plan["wait_reason"] = (f"区间震荡 {fmt(min(x['l'] for x in kl[-20:]))}"
+                                       f"~{fmt(max(x['h'] for x in kl[-20:]))}，等突破或等边缘")
         plan["invalid"] = f"站上 MA20（{fmt(m20)}）才谈做多；跌破 {fmt(low60)} 说明跌势延续"
     else:
         risk_amt = equity * RISK_PCT
